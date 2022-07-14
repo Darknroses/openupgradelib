@@ -2372,6 +2372,18 @@ def disable_invalid_filters(env):
         globaldict = {'uid': env.uid}
         if version_info[0] < 14:
             globaldict.update({'time': time})
+        if version_info[0] >= 13:
+            try:
+                from odoo.tools.safe_eval import datetime as safe_eval_datetime
+                from odoo.tools.safe_eval import dateutil
+            except ImportError:
+                import datetime as safe_eval_datetime
+                import dateutil
+            globaldict.update({
+                'datetime': safe_eval_datetime,
+                'context_today': safe_eval_datetime.datetime.now,
+                'relativedelta': dateutil.relativedelta.relativedelta,
+            })
         # DOMAIN
         try:
             with savepoint(env.cr):
@@ -2381,9 +2393,11 @@ def disable_invalid_filters(env):
                     safe_eval(domain, globaldict),
                     limit=1,
                 )
-        except Exception:
+        except Exception as e:
             logger.warning(
-                format_message(f) + "as it contains an invalid domain."
+                format_message(f) +
+                "as it contains an invalid domain %s. Detail: %s",
+                f.domain, e
             )
             f.active = False
             continue
@@ -2391,10 +2405,11 @@ def disable_invalid_filters(env):
         try:
             context = safe_eval(f.context, globaldict)
             assert(isinstance(context, dict))
-        except Exception:
+        except Exception as e:
             logger.warning(
-                format_message(f) + "as it contains an invalid context %s.",
-                f.context
+                format_message(f) +
+                "as it contains an invalid context %s. Detail: %s",
+                f.context, e
             )
             f.active = False
             continue
