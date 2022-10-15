@@ -179,6 +179,7 @@ __all__ = [
     'disable_invalid_filters',
     'safe_unlink',
     'delete_records_safely_by_xml_id',
+    'delete_sql_constraint_safely',
     'set_xml_ids_noupdate_value',
     'convert_to_company_dependent',
     'cow_templates_mark_if_equal_to_upstream',
@@ -657,12 +658,14 @@ def rename_fields(env, field_spec, no_deep=False):
         # TODO: Rename when the field is part of a submodel (ex. m2one.field)
         cr.execute("""
             UPDATE ir_filters
-            SET domain = replace(domain, %(old_pattern)s, %(new_pattern)s)
+            SET domain = regexp_replace(
+                domain, %(old_pattern)s, %(new_pattern)s, 'g'
+            )
             WHERE model_id = %%s
                 AND domain ~ %(old_pattern)s
             """ % {
-                'old_pattern': "$$'%s'$$" % old_field,
-                'new_pattern': "$$'%s'$$" % new_field,
+                'old_pattern': r"""$$('|")%s('|")$$""" % old_field,
+                'new_pattern': r"$$\1%s\2$$" % new_field,
             }, (model, ),
         )
         # Examples of replaced contexts:
@@ -673,18 +676,39 @@ def rename_fields(env, field_spec, no_deep=False):
         cr.execute(r"""
             UPDATE ir_filters
             SET context = regexp_replace(
-                context, %(old_pattern)s, %(new_pattern)s
+                context, %(old_pattern)s, %(new_pattern)s, 'g'
             )
             WHERE model_id = %%s
                 AND context ~ %(old_pattern)s
             """ % {
                 'old_pattern': (
-                    r"$$('group_by'|'col_group_by'):([^\]]*)"
+                    r"""$$('group_by'|'col_group_by'|'graph_groupbys'
+                           |'pivot_measures'|'pivot_row_groupby'
+                           |'pivot_column_groupby'
+                        ):([\s*][^\]]*)"""
                     r"'%s(:day|:week|:month|:year){0,1}'(.*?\])$$"
                 ) % old_field,
                 'new_pattern': r"$$\1:\2'%s\3'\4$$" % new_field,
             }, (model, ),
         )
+        # Examples of replaced contexts:
+        # {'graph_measure': 'field'
+        cr.execute(r"""
+            UPDATE ir_filters
+            SET context = regexp_replace(
+                context, %(old_pattern)s, %(new_pattern)s, 'g'
+            )
+            WHERE model_id = %%s
+                AND context ~ %(old_pattern)s
+            """ % {
+                'old_pattern': (
+                    r"$$'graph_measure':([\s*])'%s"
+                    r"(:day|:week|:month|:year){0,1}'$$"
+                ) % old_field,
+                'new_pattern': r"$$'graph_measure':\1'%s\2'$$" % new_field,
+            }, (model, ),
+        )
+        # TODO: Rename when the field in ir_ui_view_custom
         if table_exists(env.cr, 'mail_alias'):
             # Rename appearances on mail alias
             cr.execute("""
@@ -2154,7 +2178,8 @@ def move_field_m2o(
                 {field_new_model: value})
 
 
-def convert_field_to_html(cr, table, field_name, html_field_name):
+def convert_field_to_html(
+        cr, table, field_name, html_field_name, verbose=True):
     """
     Convert field value to HTML value.
 
@@ -2171,12 +2196,14 @@ def convert_field_to_html(cr, table, field_name, html_field_name):
         }
     )
     for row in cr.fetchall():
-        logged_query(
-            cr, "UPDATE %(table)s SET %(field)s = %%s WHERE id = %%s" % {
-                'field': html_field_name,
-                'table': table,
-            }, (plaintext2html(row[1]), row[0])
-        )
+        query = "UPDATE %(table)s SET %(field)s = %%s WHERE id = %%s" % {
+            'field': html_field_name,
+            'table': table,
+        }
+        if verbose:
+            logged_query(cr, query, (plaintext2html(row[1]), row[0]))
+        else:
+            cr.execute(query, (plaintext2html(row[1]), row[0]))
 
 
 def date_to_datetime_tz(
@@ -2404,7 +2431,7 @@ def disable_invalid_filters(env):
         # CONTEXT GROUP BY
         try:
             context = safe_eval(f.context, globaldict)
-            assert(isinstance(context, dict))
+            assert isinstance(context, dict)
         except Exception as e:
             logger.warning(
                 format_message(f) +
@@ -2769,7 +2796,7 @@ def safe_unlink(records, do_raise=False):
                         record._name, record.id, repr(e))
 
 
-def delete_records_safely_by_xml_id(env, xml_ids):
+def delete_records_safely_by_xml_id(env, xml_ids, delete_childs=False):
     """This removes in the safest possible way the records whose XML-IDs are
     passed as argument.
 
@@ -2778,6 +2805,8 @@ def delete_records_safely_by_xml_id(env, xml_ids):
     Odoo performs the regular update cleanup and trying to remove it as well.
 
     :param xml_ids: List of XML-ID string identifiers of the records to remove.
+    :param delete_childs: If true, also child ids of the given xml_ids will
+        be deleted.
     """
     errors = (KeyError, IntegrityError)
     if version_info[0] > 6 or version_info[0:2] == (6, 1):
@@ -2793,7 +2822,12 @@ def delete_records_safely_by_xml_id(env, xml_ids):
             record = env.ref(xml_id, raise_if_not_found=False)
             if not record:
                 continue
-            safe_unlink(record, do_raise=True)
+            if delete_childs:
+                child_and_parent_records = env["ir.ui.view"].search(
+                    [("inherit_id", "child_of", record.id)], order="id desc")
+                safe_unlink(child_and_parent_records, do_raise=True)
+            else:
+                safe_unlink(record, do_raise=True)
         except errors as e:
             logger.info('Error deleting XML-ID %s: %s', xml_id, repr(e))
             module, name = xml_id.split('.')
@@ -2803,6 +2837,25 @@ def delete_records_safely_by_xml_id(env, xml_ids):
             if not imd.noupdate:
                 imd.noupdate = True
                 logger.info("XML-ID %s changed to noupdate.", xml_id)
+
+
+def delete_sql_constraint_safely(env, module, table, name):
+    """In case of obsolete constraints, run this in pre-migration script.
+    Useful from v14 onwards.
+    :param module: Module where the sql constraint was declared
+    :param table: Table where the sql constraint belongs
+    :param name: Name of the sql constraint as it was declared"""
+    logged_query(
+        env.cr,
+        """ALTER TABLE {}
+           DROP CONSTRAINT IF EXISTS {}""".format(
+            table, table + "_" + name
+        ),
+    )
+    if version_info[0] > 13:
+        delete_records_safely_by_xml_id(
+            env, [module + ".constraint_" + table + "_" + name]
+        )
 
 
 def chunked(records, single=True):
