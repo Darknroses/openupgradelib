@@ -623,16 +623,17 @@ def rename_fields(env, field_spec, no_deep=False):
             """, (new_field, old_field, model),
         )
         # Rename translations
-        cr.execute("""
-            UPDATE ir_translation
-            SET name = %s
-            WHERE name = %s
-                AND type = 'model'
-            """, (
-                "%s,%s" % (model, new_field),
-                "%s,%s" % (model, old_field),
-            ),
-        )
+        if version_info[0] < 16:
+            cr.execute("""
+                UPDATE ir_translation
+                SET name = %s
+                WHERE name = %s
+                    AND type = 'model'
+                """, (
+                    "%s,%s" % (model, new_field),
+                    "%s,%s" % (model, old_field),
+                ),
+            )
         # Rename possible attachments (if field is Binary with attachment=True)
         if column_exists(cr, "ir_attachment", "res_field"):
             cr.execute("""
@@ -843,13 +844,14 @@ def rename_models(cr, model_spec):
             'UPDATE ir_model_fields SET model = %s '
             'WHERE model = %s', (new, old,),
         )
-        logged_query(
-            cr,
-            "UPDATE ir_translation SET "
-            "name=%s || substr(name, strpos(name, ',')) "
-            "WHERE name LIKE %s",
-            (new, old + ',%'),
-        )
+        if version_info[0] < 16:
+            logged_query(
+                cr,
+                "UPDATE ir_translation SET "
+                "name=%s || substr(name, strpos(name, ',')) "
+                "WHERE name LIKE %s",
+                (new, old + ',%'),
+            )
         logged_query(
             cr,
             "UPDATE ir_filters SET model_id = %s "
@@ -903,18 +905,25 @@ def rename_models(cr, model_spec):
             column = row[1]
             if not column_exists(cr, table, column):
                 continue
+            query = """
+                UPDATE {table}
+                    SET {column} = replace(
+                    {column}, %(old)s, %(new)s)
+                 WHERE {column} LIKE %(old_like)s
+            """
+            sql_query = sql.SQL(query).format(
+                table=sql.Identifier(table),
+                column=sql.Identifier(column)
+            )
             logged_query(
-                cr, """
-                 UPDATE %(table)s
-                 SET %(column)s = replace(
-                    %(column)s, '%(old)s,', '%(new)s,')
-                 WHERE %(column)s LIKE '%(old)s,%%'
-                 """ % {
-                    "table": table,
-                    "column": column,
-                    "old": old,
-                    "new": new,
-                }, skip_no_result=True,
+                cr,
+                sql_query,
+                {
+                    "old": old + ',',
+                    "old_like": old + ',%%',
+                    "new": new + ',',
+                },
+                skip_no_result=True,
             )
         # Update export profiles references
         logged_query(
@@ -1573,7 +1582,7 @@ def update_module_names(cr, namespec, merge_modules=False):
         query = ("UPDATE ir_module_module_dependency SET name = %s "
                  "WHERE name = %s")
         logged_query(cr, query, (new_name, old_name))
-        if version_info[0] > 7:
+        if version_info[0] > 7 and version_info[0] < 16:
             query = ("UPDATE ir_translation SET module = %s "
                      "WHERE module = %s")
             logged_query(cr, query, (new_name, old_name))
@@ -2691,6 +2700,8 @@ def update_module_moved_fields(
     )
     # update ir_translation - it covers both <=v8 through type='field' and
     # >=v9 through type='model' + name
+    if version_info[0] > 15:
+        return
     logged_query(
         cr, """
         UPDATE ir_translation it
@@ -2764,6 +2775,8 @@ def update_module_moved_models(cr, model, old_module, new_module):
             AND imf.model = %s AND imd.module = %s""",
         (new_module, AsIs(table), AsIs(underscore), model, old_module),
     )
+    if version_info[0] > 15:
+        return
     logged_query(
         cr,
         "UPDATE ir_translation SET module=%s "
